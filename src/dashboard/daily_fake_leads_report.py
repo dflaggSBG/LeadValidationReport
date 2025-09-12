@@ -1,6 +1,7 @@
 """Daily Fake Leads by Source Report - Focused monitoring dashboard."""
 import streamlit as st
 import sys
+import subprocess
 from pathlib import Path
 import pandas as pd
 import plotly.express as px
