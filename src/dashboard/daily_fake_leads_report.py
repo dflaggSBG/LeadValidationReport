@@ -597,37 +597,32 @@ def main():
     current_date = datetime.now().strftime("%A, %B %d, %Y")
     last_refresh = get_last_refresh_time()
     
-    # Main layout with sidebar for refresh button
-    col_sidebar, col_main = st.columns([1, 4])
+    st.markdown(f'''
+    <div class="main-header">
+        🚨 Daily Fake Leads Report<br>
+        <small>{current_date}</small><br>
+        <small style="color: #666; font-size: 0.8rem;">Last Updated: {last_refresh}</small>
+    </div>
+    ''', unsafe_allow_html=True)
     
-    with col_sidebar:
-        st.markdown("### Controls")
-        if st.button("🔄 Refresh Data", help="Run ETL pipeline to sync latest data from Salesforce", type="primary", use_container_width=True):
-            if run_etl_pipeline():
-                st.rerun()
-            else:
-                st.error("Failed to refresh data. Please check ETL configuration.")
+    # Inline refresh button
+    if st.button("🔄 Refresh Data", help="Run ETL pipeline to sync latest data from Salesforce"):
+        if run_etl_pipeline():
+            st.rerun()
+        else:
+            st.error("Failed to refresh data. Please check ETL configuration.")
     
-    with col_main:
-        st.markdown(f'''
-        <div class="main-header">
-            🚨 Daily Fake Leads Report<br>
-            <small>{current_date}</small><br>
-            <small style="color: #666; font-size: 0.8rem;">Last Updated: {last_refresh}</small>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        # Main report sections
-        show_daily_summary()
-        st.markdown("---")
-        
-        show_fake_leads_by_source_table()
-        st.markdown("---")
-        
-        show_fake_leads_detail()
-        st.markdown("---")
-        
-        show_hourly_breakdown()
+    # Main report sections
+    show_daily_summary()
+    st.markdown("---")
+    
+    show_fake_leads_by_source_table()
+    st.markdown("---")
+    
+    show_fake_leads_detail()
+    st.markdown("---")
+    
+    show_hourly_breakdown()
     
     # Footer with navigation
     st.markdown("---")
