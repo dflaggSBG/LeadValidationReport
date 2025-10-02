@@ -127,7 +127,7 @@ def load_overall_results(date_filter="All Time"):
         
         # Try simplified view first, fall back to existing data structure
         try:
-            query = f"SELECT * FROM leads.simplified_overall_results WHERE created_date {date_clause}"
+            query = "SELECT * FROM simplified_overall_results"
             result = pd.read_sql(query, conn)
             conn.close()
             return result
@@ -194,7 +194,7 @@ def load_results_by_source(date_filter="All Time"):
         
         # Try simplified view first, fall back to existing data structure
         try:
-            query = f"SELECT * FROM leads.simplified_results_by_source WHERE created_date {date_clause} ORDER BY avg_data_quality_score DESC"
+            query = "SELECT * FROM simplified_results_by_source ORDER BY avg_data_quality_score DESC"
             result = pd.read_sql(query, conn)
             conn.close()
             return result
@@ -256,7 +256,7 @@ def load_fake_leads(date_filter="All Time"):
         
         # Try simplified view first, fall back to existing data structure
         try:
-            query = f"SELECT * FROM leads.fake_leads_detail WHERE created_date {date_clause} ORDER BY fraud_score DESC LIMIT 100"
+            query = "SELECT * FROM fake_leads_detail ORDER BY fraud_score DESC LIMIT 100"
             result = pd.read_sql(query, conn)
             conn.close()
             return result

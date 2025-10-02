@@ -1,49 +1,51 @@
--- Fake Leads Detail View
+-- Fake Leads Detail View (Fixed for actual database structure)
 -- Lists fake leads and provides results for each validation point
 
-CREATE OR REPLACE VIEW leads.fake_leads_detail AS
+CREATE OR REPLACE VIEW fake_leads_detail AS
 WITH fraud_breakdown AS (
   SELECT 
-    vr.*,
-    -- Extract specific fraud indicators from JSON validation details
-    -- Note: These would be populated from the fraud_detection engine results
-    CASE WHEN JSON_EXTRACT(validation_details, '$.fraud.fraud_indicators') LIKE '%email%' THEN 1 ELSE 0 END as email_fraud_flag,
-    CASE WHEN JSON_EXTRACT(validation_details, '$.fraud.fraud_indicators') LIKE '%phone%' THEN 1 ELSE 0 END as phone_fraud_flag,
-    CASE WHEN JSON_EXTRACT(validation_details, '$.fraud.fraud_indicators') LIKE '%name%' THEN 1 ELSE 0 END as name_fraud_flag,
-    CASE WHEN JSON_EXTRACT(validation_details, '$.fraud.fraud_indicators') LIKE '%company%' THEN 1 ELSE 0 END as company_fraud_flag,
+    pv.*,
+    -- Extract specific fraud indicators from raw JSON if available
+    CASE WHEN raw_api_response LIKE '%email%fraud%' OR raw_api_response LIKE '%email%invalid%' THEN 1 ELSE 0 END as email_fraud_flag,
+    CASE WHEN raw_api_response LIKE '%phone%fraud%' OR raw_api_response LIKE '%phone%invalid%' THEN 1 ELSE 0 END as phone_fraud_flag,
+    CASE WHEN raw_api_response LIKE '%name%gibberish%' OR raw_api_response LIKE '%hasGibberishNames%true%' THEN 1 ELSE 0 END as name_fraud_flag,
+    CASE WHEN raw_api_response LIKE '%company%gibberish%' OR raw_api_response LIKE '%hasGibberishCompany%true%' THEN 1 ELSE 0 END as company_fraud_flag,
     
-    -- Individual validation scores
-    COALESCE(JSON_EXTRACT_SCALAR(validation_details, '$.email.score'), '0')::DOUBLE as email_quality_score,
-    COALESCE(JSON_EXTRACT_SCALAR(validation_details, '$.phone.score'), '0')::DOUBLE as phone_quality_score,
-    COALESCE(JSON_EXTRACT_SCALAR(validation_details, '$.name.score'), '0')::DOUBLE as name_quality_score,
-    COALESCE(JSON_EXTRACT_SCALAR(validation_details, '$.company.score'), '0')::DOUBLE as company_quality_score,
-    COALESCE(JSON_EXTRACT_SCALAR(validation_details, '$.completeness.score'), '0')::DOUBLE as completeness_score
+    -- Individual validation scores (normalize from actual structure)
+    COALESCE(api_email_valid, false) as email_valid,
+    COALESCE(api_phone_valid, false) as phone_valid,
+    0.8 as email_quality_score,  -- Default scores since individual scores aren't stored separately
+    0.8 as phone_quality_score,
+    0.8 as name_quality_score,
+    0.8 as company_quality_score,
+    0.8 as completeness_score
     
-  FROM leads.validation_results vr
-  WHERE fraud_score >= 0.6  -- Focus on medium to high fraud risk
+  FROM parsed_validations pv
+  WHERE parse_error IS NULL
+  AND (COALESCE(api_fake_lead, false) = true OR COALESCE(api_fraud_score, 0) >= 6)  -- Focus on fake or medium+ fraud risk
 )
 SELECT 
-    lead_id,
+    task_id as lead_id,
     lead_source,
-    validation_timestamp,
+    parsed_at as validation_timestamp,
     
     -- Lead data
-    first_name,
-    last_name,
-    email,
-    phone,
-    company,
+    COALESCE(api_first_name, '') as first_name,
+    COALESCE(api_last_name, '') as last_name,
+    COALESCE(api_email, lead_email) as email,
+    COALESCE(api_phone, '') as phone,
+    COALESCE(api_company, lead_company) as company,
     
-    -- Overall scores
-    data_quality_score,
-    fraud_score,
-    overall_score,
+    -- Overall scores (normalized)
+    COALESCE(api_data_quality_score, api_quality_score, quality_score) / 10.0 as data_quality_score,
+    COALESCE(api_fraud_score, 0) / 10.0 as fraud_score,
+    COALESCE(api_quality_score, quality_score) / 10.0 as overall_score,
     
-    -- Fraud risk level
+    -- Fraud risk level (using 10-point scale)
     CASE 
-        WHEN fraud_score >= 0.8 THEN 'CRITICAL'
-        WHEN fraud_score >= 0.7 THEN 'HIGH'
-        WHEN fraud_score >= 0.6 THEN 'MEDIUM'
+        WHEN COALESCE(api_fraud_score, 0) >= 8 THEN 'CRITICAL'
+        WHEN COALESCE(api_fraud_score, 0) >= 7 THEN 'HIGH'
+        WHEN COALESCE(api_fraud_score, 0) >= 6 THEN 'MEDIUM'
         ELSE 'LOW'
     END as fraud_risk_level,
     
@@ -85,21 +87,24 @@ SELECT
     -- Fraud indicators summary
     (email_fraud_flag + phone_fraud_flag + name_fraud_flag + company_fraud_flag) as fraud_indicators_count,
     
-    -- Issues summary
+    -- Issues summary (using 10-point scale)
     CASE 
-        WHEN fraud_score >= 0.8 THEN 'Multiple fraud indicators detected - HIGH PRIORITY'
-        WHEN fraud_score >= 0.7 THEN 'Likely fraudulent lead - investigate'  
-        WHEN fraud_score >= 0.6 THEN 'Suspicious patterns found - review recommended'
+        WHEN COALESCE(api_fraud_score, 0) >= 8 THEN 'Multiple fraud indicators detected - HIGH PRIORITY'
+        WHEN COALESCE(api_fraud_score, 0) >= 7 THEN 'Likely fraudulent lead - investigate'  
+        WHEN COALESCE(api_fraud_score, 0) >= 6 THEN 'Suspicious patterns found - review recommended'
         ELSE 'Minor quality issues detected'
     END as validation_summary,
     
-    -- Action recommended
-    CASE 
-        WHEN fraud_score >= 0.8 THEN 'REJECT - Do not contact'
-        WHEN fraud_score >= 0.7 THEN 'QUARANTINE - Manual review required'
-        WHEN fraud_score >= 0.6 THEN 'FLAG - Use caution in outreach'
-        ELSE 'MONITOR - Track for patterns'
-    END as recommended_action
+    -- Action recommended (using actual API recommendation when available)
+    COALESCE(
+        api_recommendation,
+        CASE 
+            WHEN COALESCE(api_fraud_score, 0) >= 8 THEN 'reject'
+            WHEN COALESCE(api_fraud_score, 0) >= 7 THEN 'review'
+            WHEN COALESCE(api_fraud_score, 0) >= 6 THEN 'flag'
+            ELSE 'monitor'
+        END
+    ) as recommended_action
 
 FROM fraud_breakdown
-ORDER BY fraud_score DESC, validation_timestamp DESC;
+ORDER BY COALESCE(api_fraud_score, 0) DESC, parsed_at DESC;

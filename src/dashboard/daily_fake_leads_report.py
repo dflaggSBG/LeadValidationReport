@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
+import re
 
 # Add project root to path for imports
 project_root = Path(__file__).parent.parent.parent
@@ -121,20 +122,25 @@ st.markdown("""
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
-def load_daily_fake_leads():
-    """Load today's fake leads by source."""
+def load_daily_fake_leads(start_date=None, end_date=None):
+    """Load fake leads by source for the specified date range."""
     try:
         conn = get_database_connection()
         
-        # Try to use the dedicated view first
-        try:
-            query = "SELECT * FROM leads.daily_fake_leads_by_source"
-            result = pd.read_sql(query, conn)
-            conn.close()
-            return result
-        except:
-            # Fall back to direct query
-            query = """
+        # Build date filter using simpler approach  
+        if start_date and end_date:
+            if start_date == end_date:
+                # Single day
+                where_clause = f"AND created_date >= '{start_date} 00:00:00' AND created_date <= '{start_date} 23:59:59'"
+            else:
+                # Date range
+                where_clause = f"AND created_date >= '{start_date} 00:00:00' AND created_date <= '{end_date} 23:59:59'"
+        else:
+            # Default to today
+            where_clause = "AND DATE_TRUNC('day', created_date) = CURRENT_DATE"
+        
+        # Build query with string concatenation to avoid f-string issues
+        query = """
             SELECT 
                 COALESCE(lead_source, 'Unknown') as lead_source,
                 COUNT(*) as total_leads_today,
@@ -159,13 +165,13 @@ def load_daily_fake_leads():
                 CURRENT_DATE as report_date
             FROM parsed_validations
             WHERE parse_error IS NULL
-            AND DATE_TRUNC('day', created_date) = CURRENT_DATE
+        """ + where_clause + """
             GROUP BY COALESCE(lead_source, 'Unknown')
             ORDER BY fake_leads_percentage DESC, fake_leads_count DESC
-            """
-            result = pd.read_sql(query, conn)
-            conn.close()
-            return result
+        """
+        result = pd.read_sql(query, conn)
+        conn.close()
+        return result
             
     except Exception as e:
         st.error(f"Error loading daily fake leads: {e}")
@@ -173,10 +179,24 @@ def load_daily_fake_leads():
 
 
 @st.cache_data(ttl=300)
-def load_daily_fake_leads_detail():
-    """Load detailed list of today's fake and high risk leads."""
+def load_daily_fake_leads_detail(start_date=None, end_date=None):
+    """Load detailed list of fake and high risk leads for the specified date range."""
     try:
         conn = get_database_connection()
+        
+        # Build date filter using simpler approach
+        if start_date and end_date:
+            if start_date == end_date:
+                # Single day
+                where_clause = f"AND created_date >= '{start_date} 00:00:00' AND created_date <= '{start_date} 23:59:59'"
+            else:
+                # Date range
+                where_clause = f"AND created_date >= '{start_date} 00:00:00' AND created_date <= '{end_date} 23:59:59'"
+        else:
+            # Default to today
+            where_clause = "AND DATE_TRUNC('day', created_date) = CURRENT_DATE"
+        
+        # Build query with string concatenation to avoid f-string issues
         query = """
         SELECT 
             task_id as lead_id,
@@ -203,7 +223,7 @@ def load_daily_fake_leads_detail():
             
         FROM parsed_validations
         WHERE parse_error IS NULL
-        AND DATE_TRUNC('day', created_date) = CURRENT_DATE
+        """ + where_clause + """
         AND (
             COALESCE(api_fake_lead, false) = true 
             OR COALESCE(api_fraud_score, 0) >= 8
@@ -223,48 +243,61 @@ def load_daily_fake_leads_detail():
 
 
 def show_daily_summary():
-    """Show daily summary statistics."""
-    st.markdown('<div class="section-header">📊 Today\'s Fake Leads Summary</div>', unsafe_allow_html=True)
+    """Show summary statistics for selected date range."""
+    # Get date range from session state
+    start_date = st.session_state.get('report_start_date', datetime.now().date())
+    end_date = st.session_state.get('report_end_date', datetime.now().date())
     
-    data = load_daily_fake_leads()
+    # Dynamic section title
+    if start_date == end_date:
+        section_title = f"📊 Fake Leads Summary - {start_date.strftime('%B %d, %Y')}"
+    else:
+        section_title = f"📊 Fake Leads Summary - {start_date.strftime('%b %d')} to {end_date.strftime('%b %d, %Y')}"
+    
+    st.markdown(f'<div class="section-header">{section_title}</div>', unsafe_allow_html=True)
+    
+    data = load_daily_fake_leads(start_date, end_date)
     
     if data.empty:
-        st.success("🎉 **No fake leads detected today!** All sources are clean.")
+        date_desc = "today" if start_date == end_date == datetime.now().date() else "for the selected date range"
+        st.success(f"🎉 **No fake leads detected {date_desc}!** All sources are clean.")
         return
     
     # Overall daily metrics
     total_leads_today = data['total_leads_today'].sum()
     total_fake_leads = data['fake_leads_count'].sum()
     total_fake_percentage = (total_fake_leads / total_leads_today * 100) if total_leads_today > 0 else 0
-    total_high_risk = data['critical_fraud_count'].sum() if 'critical_fraud_count' in data.columns else 0
-    total_high_risk_percentage = (total_high_risk / total_leads_today * 100) if total_leads_today > 0 else 0
+    
+    # Get unique count of problematic leads (fake + high risk, no double counting)
+    problematic_leads_detail = load_daily_fake_leads_detail(start_date, end_date)
+    total_problematic_leads = len(problematic_leads_detail) if not problematic_leads_detail.empty else 0
+    fake_count_unique = len(problematic_leads_detail[problematic_leads_detail['lead_type'] == 'FAKE']) if not problematic_leads_detail.empty else 0
+    high_risk_count_unique = len(problematic_leads_detail[problematic_leads_detail['lead_type'] == 'HIGH_RISK']) if not problematic_leads_detail.empty else 0
+    total_problematic_percentage = (total_problematic_leads / total_leads_today * 100) if total_leads_today > 0 else 0
     
     # Key metrics cards
     col1, col2, col3 = st.columns(3)
     
     with col1:
+        date_desc = "Today" if start_date == end_date == datetime.now().date() else "Selected Period"
         st.metric(
-            label="📊 Leads Validated Today",
+            label=f"📊 Leads Validated ({date_desc})",
             value=f"{total_leads_today:,}",
-            help="Leads created today that went through validation (may differ from current SF status)"
+            help=f"Leads created in selected date range that went through validation"
         )
     
     with col2:
         st.metric(
-            label="🚨 Fake Leads Today", 
-            value=f"{total_fake_leads}",
-            delta=f"{total_fake_percentage:.1f}% of today's leads",
-            delta_color="inverse" if total_fake_leads > 0 else "normal",
-            help="Number and percentage of fake leads detected today"
+            label="🚨 Fake Leads", 
+            value=f"{fake_count_unique}",
+            help="Number of fake leads detected in selected period"
         )
     
     with col3:
         st.metric(
-            label="⚠️ High Risk Leads",
-            value=f"{total_high_risk}",
-            delta=f"{total_high_risk_percentage:.1f}% of today's leads",
-            delta_color="inverse" if total_high_risk > 0 else "normal",
-            help="Leads with critical fraud scores (8+/10) requiring attention"
+            label="⚠️ Total Problematic Leads",
+            value=f"{total_problematic_leads}",
+            help=f"Total unique problematic leads: {fake_count_unique} fake + {high_risk_count_unique} high risk (no double counting)"
         )
 
 
@@ -272,16 +305,34 @@ def show_fake_leads_by_source_table():
     """Show a clean table of fake leads count by lead source."""
     st.markdown('<div class="section-header">📊 Fake Leads by Lead Source</div>', unsafe_allow_html=True)
     
-    data = load_daily_fake_leads()
+    # Get date range from session state
+    start_date = st.session_state.get('report_start_date', datetime.now().date())
+    end_date = st.session_state.get('report_end_date', datetime.now().date())
+    
+    data = load_daily_fake_leads(start_date, end_date)
     
     if data.empty:
         st.info("No data available for today.")
         return
     
-    # Create focused table
-    table_columns = ['lead_source', 'total_leads_today', 'fake_leads_count', 'fake_leads_percentage', 'daily_risk_level']
-    if 'critical_fraud_count' in data.columns:
-        table_columns.insert(3, 'critical_fraud_count')
+    # Create focused table with explicit column ordering
+    # Order: Lead Source | Total Leads | Fake Leads | High Risk | Fake % | High Risk %
+    if 'critical_fraud_count' in data.columns and 'critical_fraud_percentage' in data.columns:
+        table_columns = [
+            'lead_source', 
+            'total_leads_today', 
+            'fake_leads_count', 
+            'critical_fraud_count',
+            'fake_leads_percentage',
+            'critical_fraud_percentage'
+        ]
+    else:
+        table_columns = [
+            'lead_source', 
+            'total_leads_today', 
+            'fake_leads_count', 
+            'fake_leads_percentage'
+        ]
     
     table_data = data[table_columns].copy()
     
@@ -293,27 +344,18 @@ def show_fake_leads_by_source_table():
     
     # Format the data
     table_data['fake_leads_percentage'] = table_data['fake_leads_percentage'].round(1)
+    if 'critical_fraud_percentage' in table_data.columns:
+        table_data['critical_fraud_percentage'] = table_data['critical_fraud_percentage'].round(1)
     
-    # Rename columns for clean display
-    if 'critical_fraud_count' in table_data.columns:
-        table_data.columns = ['Lead Source', 'Total Leads', 'Fake Leads', 'High Risk', 'Fake %', 'Risk Level']
+    # Rename columns for clean display (ensuring correct order)
+    if 'critical_fraud_count' in table_data.columns and 'critical_fraud_percentage' in table_data.columns:
+        table_data.columns = ['Lead Source', 'Total Leads', 'Fake Leads', 'High Risk', 'Fake %', 'High Risk %']
     else:
-        table_data.columns = ['Lead Source', 'Total Leads', 'Fake Leads', 'Fake %', 'Risk Level']
+        table_data.columns = ['Lead Source', 'Total Leads', 'Fake Leads', 'Fake %']
     
-    # Color code the risk levels
-    def style_risk_level(val):
-        colors = {
-            'CRITICAL': 'background-color: #ffcdd2; color: #c62828',
-            'HIGH': 'background-color: #ffe0b2; color: #ef6c00', 
-            'MEDIUM': 'background-color: #fff3e0; color: #f57c00',
-            'LOW': 'background-color: #f3e5f5; color: #8e24aa',
-            'CLEAN': 'background-color: #e8f5e8; color: #2e7d32'
-        }
-        return colors.get(val, '')
-    
-    # Display the table with formatting
+    # Display the table (no special styling needed)
     st.dataframe(
-        table_data.style.map(style_risk_level, subset=['Risk Level']),
+        table_data,
         use_container_width=True,
         hide_index=True,
         height=300
@@ -327,283 +369,128 @@ def show_fake_leads_by_source_table():
         st.info(f"📊 **{sources_with_fakes} out of {total_sources} sources** sent fake leads today")
     else:
         st.success(f"✅ **All {total_sources} sources are clean** today")
-
-
-def show_fake_leads_detail():
-    """Show detailed list of today's fake and high risk leads."""
-    st.markdown('<div class="section-header">🔍 Today\'s Problematic Leads - Detailed Analysis</div>', unsafe_allow_html=True)
     
-    problematic_leads = load_daily_fake_leads_detail()
-    
-    if problematic_leads.empty:
-        st.success("🎉 No fake or high risk leads detected today!")
-        return
-    
-    # Count by type
-    fake_count = len(problematic_leads[problematic_leads['lead_type'] == 'FAKE'])
-    high_risk_count = len(problematic_leads[problematic_leads['lead_type'] == 'HIGH_RISK'])
-    
-    st.markdown(f"**Found {len(problematic_leads)} problematic leads today:** {fake_count} fake leads + {high_risk_count} high risk leads")
-    
-    # Group by source for better organization
-    for source in problematic_leads['lead_source'].unique():
-        source_leads = problematic_leads[problematic_leads['lead_source'] == source]
+    # Add direct download functionality here
+    col_export = st.columns([1, 1, 1])[1]  # Center the button
+    with col_export:
+        # Get date range and load problematic leads data directly
+        start_date = st.session_state.get('report_start_date', datetime.now().date())
+        end_date = st.session_state.get('report_end_date', datetime.now().date())
         
-        # Count fake vs high risk for this source
-        source_fake_count = len(source_leads[source_leads['lead_type'] == 'FAKE'])
-        source_high_risk_count = len(source_leads[source_leads['lead_type'] == 'HIGH_RISK'])
+        # Load the problematic leads data for export
+        export_leads = load_daily_fake_leads_detail(start_date, end_date)
         
-        # Create expander title based on what types of leads exist
-        if source_fake_count > 0 and source_high_risk_count > 0:
-            expander_title = f"🚨 {source} - {source_fake_count} fake + {source_high_risk_count} high risk leads"
-        elif source_fake_count > 0:
-            expander_title = f"🚨 {source} - {source_fake_count} fake leads"
-        else:
-            expander_title = f"⚠️ {source} - {source_high_risk_count} high risk leads"
-        
-        with st.expander(expander_title, expanded=True):
-            for _, lead in source_leads.iterrows():
-                # Different styling for fake vs high risk
-                if lead['lead_type'] == 'FAKE':
-                    card_class = "fake-lead-card"
-                    type_indicator = "🚨 FAKE"
-                else:
-                    card_class = "fake-lead-card"  # Use same styling for now
-                    type_indicator = "⚠️ HIGH RISK"
+        if not export_leads.empty:
+            # Generate the export data with parsed factors
+            def parse_factors(factors_text):
+                """Parse fraud/quality factors into individual metrics."""
+                import re
+                factors = {}
+                if pd.isna(factors_text) or factors_text in ['No specific factors', 'No factors']:
+                    return factors
                 
-                st.markdown(f"""
-                <div class="{card_class}">
-                    <strong>{type_indicator}: {lead['first_name']} {lead['last_name']}</strong> (ID: {lead['lead_id']}) | Fraud: {lead['fraud_score']}/10 | Action: {lead['recommendation'].upper()}<br>
-                    Email: {lead['email']} | Phone: {lead['phone'] if lead['phone'] else 'Missing'} | Company: {lead['company'] if lead['company'] else 'Missing'}<br>
-                    <strong>Fraud Factors:</strong> {lead['fraud_factors']}<br>
-                    <strong>Quality Issues:</strong> {lead['quality_factors']}
-                </div>
-                """, unsafe_allow_html=True)
-
-
-def show_hourly_breakdown():
-    """Show hourly breakdown of today's fake and high risk leads by source."""
-    st.markdown('<div class="section-header">⏰ Hourly Problem Lead Pattern by Source (Today)</div>', unsafe_allow_html=True)
-    
-    try:
-        conn = get_database_connection()
-        
-        # Get hourly data with source breakdown
-        query = """
-        SELECT 
-            EXTRACT(hour FROM created_date) as hour_of_day,
-            COALESCE(lead_source, 'Unknown') as lead_source,
-            COUNT(*) as total_leads,
-            COUNTIF(COALESCE(api_fake_lead, false) = true OR COALESCE(api_fraud_score, 0) >= 8) as fake_leads,
-            ROUND((COUNTIF(COALESCE(api_fake_lead, false) = true)::DOUBLE / COUNT(*)) * 100, 2) as fake_percentage
-        FROM parsed_validations
-        WHERE parse_error IS NULL
-        AND DATE_TRUNC('day', created_date) = CURRENT_DATE
-        GROUP BY EXTRACT(hour FROM created_date), COALESCE(lead_source, 'Unknown')
-        HAVING COUNT(*) > 0
-        ORDER BY hour_of_day, lead_source
-        """
-        
-        hourly_source_data = pd.read_sql(query, conn)
-        conn.close()
-        
-        if hourly_source_data.empty:
-            st.info("No hourly data available for today.")
-            return
-        
-        # Create side-by-side charts
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Total leads by hour and source (stacked)
-            fig1 = px.bar(
-                hourly_source_data,
-                x='hour_of_day',
-                y='total_leads',
-                color='lead_source',
-                title="Total Leads by Hour & Source",
-                labels={'hour_of_day': 'Hour', 'total_leads': 'Total Leads'}
+                text = str(factors_text)
+                
+                # Common fraud factor patterns
+                if 'Known fake lead from database' in text:
+                    factors['Known Fake Lead'] = 'TRUE'
+                if 'ML fraud model' in text:
+                    ml_match = re.search(r'ML fraud model.*?score[:\s]*(\d+)', text)
+                    if ml_match:
+                        factors['ML Fraud Score'] = ml_match.group(1)
+                    risk_match = re.search(r'ML fraud model[:\s]*(MEDIUM|HIGH|LOW|NORMAL) RISK', text)
+                    if risk_match:
+                        factors['ML Risk Level'] = risk_match.group(1)
+                
+                # Email factors
+                if 'Email not deliverable' in text:
+                    factors['Email Deliverable'] = 'NO'
+                if 'Email deliverable' in text and 'not' not in text:
+                    factors['Email Deliverable'] = 'YES'
+                if 'Valid email format' in text:
+                    factors['Email Format Valid'] = 'YES'
+                if 'Invalid email' in text:
+                    factors['Email Format Valid'] = 'NO'
+                
+                # Phone factors  
+                if 'Valid phone number' in text:
+                    factors['Phone Valid'] = 'YES'
+                if 'Invalid phone' in text:
+                    factors['Phone Valid'] = 'NO'
+                
+                # Geographic factors
+                if 'ZIP/state consistent' in text:
+                    factors['ZIP State Consistent'] = 'YES'
+                if 'Valid postal code' in text:
+                    factors['Postal Code Valid'] = 'YES'
+                if 'Valid state' in text:
+                    factors['State Valid'] = 'YES'
+                
+                # Data completeness
+                completeness_match = re.search(r'Data completeness \((\d+)/(\d+)\)', text)
+                if completeness_match:
+                    factors['Data Completeness'] = f"{completeness_match.group(1)}/{completeness_match.group(2)}"
+                
+                return factors
+            
+            # Create export table
+            export_table = export_leads.copy()
+            export_table['name'] = export_table['first_name'] + ' ' + export_table['last_name']
+            export_table['phone_display'] = export_table['phone'].apply(lambda x: x if x else 'Missing')
+            export_table['company_display'] = export_table['company'].apply(lambda x: x if x else 'Missing')
+            
+            # Parse factors for each lead
+            all_factors = []
+            for _, row in export_table.iterrows():
+                fraud_parsed = parse_factors(row['fraud_factors'])
+                quality_parsed = parse_factors(row['quality_factors'])
+                combined_factors = {**fraud_parsed, **quality_parsed}
+                all_factors.append(combined_factors)
+            
+            # Get all unique factor names
+            all_factor_names = set()
+            for factors in all_factors:
+                all_factor_names.update(factors.keys())
+            
+            # Create final export table
+            final_export = export_table[[
+                'lead_id', 'lead_type', 'name', 'email', 'phone_display', 
+                'company_display', 'lead_source', 'fraud_score', 'recommendation'
+            ]].copy()
+            
+            # Add factor columns
+            for factor_name in sorted(all_factor_names):
+                final_export[factor_name] = ''
+            
+            # Populate factor columns
+            for i, factors in enumerate(all_factors):
+                for factor_name, factor_value in factors.items():
+                    final_export.loc[i, factor_name] = factor_value
+            
+            # Add original text columns
+            final_export['Original Fraud Factors'] = export_table['fraud_factors']
+            final_export['Original Quality Issues'] = export_table['quality_factors']
+            
+            # Rename columns
+            base_columns = [
+                'Lead ID', 'Type', 'Name', 'Email', 'Phone', 
+                'Company', 'Source', 'Fraud Score', 'Action'
+            ]
+            final_export.columns = base_columns + list(sorted(all_factor_names)) + ['Original Fraud Factors', 'Original Quality Issues']
+            
+            csv = final_export.to_csv(index=False)
+            
+            st.download_button(
+                label="📥 Download All Data",
+                data=csv,
+                file_name=f"problematic_leads_complete_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                help="Download complete problematic leads data with parsed factors",
+                type="secondary",
+                use_container_width=True
             )
-            fig1.update_layout(height=300, margin=dict(t=40, b=40, l=40, r=40))
-            st.plotly_chart(fig1, use_container_width=True)
-        
-        with col2:
-            # Problem leads (fake + high risk) only by hour and source
-            problem_only = hourly_source_data[hourly_source_data['fake_leads'] > 0]
-            
-            if not problem_only.empty:
-                fig2 = px.bar(
-                    problem_only,
-                    x='hour_of_day',
-                    y='fake_leads',
-                    color='lead_source',
-                    title="Problem Leads by Hour & Source",
-                    labels={'hour_of_day': 'Hour', 'fake_leads': 'Problem Leads (Fake + High Risk)'}
-                )
-                fig2.update_layout(height=300, margin=dict(t=40, b=40, l=40, r=40))
-                st.plotly_chart(fig2, use_container_width=True)
-            else:
-                st.success("✅ No problematic leads detected at any hour today")
-        
-        # Show hourly source breakdown table for problem leads only
-        if not problem_only.empty:
-            st.markdown('<div class="sub-header">📊 Problem Leads by Hour & Source</div>', unsafe_allow_html=True)
-            
-            # Pivot table for easier reading
-            pivot_data = problem_only.pivot(index='lead_source', columns='hour_of_day', values='fake_leads').fillna(0)
-            
-            # Only show hours that have problem leads
-            active_hours = problem_only['hour_of_day'].unique()
-            pivot_data = pivot_data[sorted(active_hours)]
-            
-            # Add row totals
-            pivot_data['Total'] = pivot_data.sum(axis=1)
-            
-            # Sort by total problem leads
-            pivot_data = pivot_data.sort_values('Total', ascending=False)
-            
-            # Format as integers
-            pivot_data = pivot_data.astype(int)
-            
-            st.dataframe(
-                pivot_data,
-                use_container_width=True,
-                height=200
-            )
-        
-    except Exception as e:
-        st.error(f"Error loading hourly breakdown: {e}")
-
-
-@st.cache_data(ttl=300)
-def load_fake_leads_anomalies():
-    """Load leads that were flagged as fake but may have progressed inappropriately."""
-    try:
-        conn = get_database_connection()
-        
-        # Look for leads with contradictory validation vs recommendation
-        query = """
-        SELECT 
-            task_id,
-            who_id as lead_id,
-            COALESCE(api_first_name, '') as first_name,
-            COALESCE(api_last_name, '') as last_name,
-            COALESCE(api_email, lead_email) as email,
-            COALESCE(api_company, lead_company) as company,
-            lead_source,
-            created_date,
-            parsed_at as validation_timestamp,
-            COALESCE(api_fake_lead, false) as was_flagged_fake,
-            COALESCE(api_fraud_score, 0) as fraud_score,
-            COALESCE(api_fraud_factors, 'No factors') as fraud_factors,
-            COALESCE(api_recommendation, 'unknown') as validation_recommendation,
-            
-            -- Anomaly detection based on contradictions
-            CASE 
-                WHEN COALESCE(api_fake_lead, false) = true AND COALESCE(api_recommendation, '') = 'accept' THEN 'FAKE_BUT_ACCEPTED'
-                WHEN COALESCE(api_fraud_score, 0) >= 8 AND COALESCE(api_recommendation, '') = 'accept' THEN 'HIGH_FRAUD_BUT_ACCEPTED'
-                WHEN COALESCE(api_fake_lead, false) = true AND COALESCE(api_fraud_score, 0) < 5 THEN 'FAKE_FLAG_LOW_SCORE'
-                WHEN COALESCE(api_recommendation, '') = 'reject' AND COALESCE(api_fraud_score, 0) < 3 THEN 'REJECT_RECOMMENDATION_LOW_SCORE'
-                ELSE 'CONSISTENT'
-            END as anomaly_type,
-            
-            -- Risk level
-            CASE 
-                WHEN COALESCE(api_fake_lead, false) = true AND COALESCE(api_recommendation, '') = 'accept' THEN 'CRITICAL'
-                WHEN COALESCE(api_fraud_score, 0) >= 8 AND COALESCE(api_recommendation, '') = 'accept' THEN 'HIGH'
-                WHEN COALESCE(api_fake_lead, false) = true THEN 'MEDIUM'
-                ELSE 'LOW'
-            END as anomaly_risk_level
-            
-        FROM parsed_validations
-        WHERE parse_error IS NULL
-        AND DATE_TRUNC('day', created_date) = CURRENT_DATE
-        AND (
-            COALESCE(api_fake_lead, false) = true 
-            OR COALESCE(api_fraud_score, 0) >= 7
-            OR COALESCE(api_recommendation, '') = 'reject'
-        )
-        """
-        
-        result = pd.read_sql(query, conn)
-        conn.close()
-        return result
-        
-    except Exception as e:
-        st.error(f"Error loading validation anomalies: {e}")
-        return pd.DataFrame()
-
-
-def show_fake_leads_anomalies():
-    """Display validation issues that need review."""
-    st.markdown('<div class="section-header">🔍 Quality Review</div>', unsafe_allow_html=True)
-    st.markdown("*Leads with high fraud scores that were recommended to accept - these need review*")
-    
-    anomalies = load_fake_leads_anomalies()
-    
-    if anomalies.empty:
-        st.success("✅ No leads to review.")
-        return
-    
-    # Filter to actual issues (high fraud but recommended to accept)
-    review_needed = anomalies[
-        (anomalies['fraud_score'] >= 7) & 
-        (anomalies['validation_recommendation'] == 'accept')
-    ]
-    
-    if review_needed.empty:
-        st.success("✅ All high-risk leads were properly flagged for rejection.")
-        return
-    
-    st.warning(f"⚠️ **{len(review_needed)} leads need review** - High fraud scores but recommended to accept")
-    
-    # Show the problematic leads in a simple table
-    display_data = review_needed[['lead_id', 'first_name', 'last_name', 'company', 'lead_source', 'fraud_score', 'fraud_factors']].copy()
-    display_data['name'] = display_data['first_name'] + ' ' + display_data['last_name']
-    display_data = display_data[['lead_id', 'name', 'company', 'lead_source', 'fraud_score', 'fraud_factors']]
-    display_data['fraud_factors'] = display_data['fraud_factors'].str[:50] + '...'  # Truncate for readability
-    display_data.columns = ['Lead ID', 'Name', 'Company', 'Source', 'Fraud Score', 'Why High Risk']
-    
-    st.dataframe(
-        display_data,
-        use_container_width=True,
-        hide_index=True,
-        height=250
-    )
-    
-    if len(review_needed) > 0:
-        st.error("🚨 **Action Required:** These leads have high fraud scores (7+/10) but were recommended to accept. Review to ensure they're legitimate.")
-
-
-def show_alerts_and_actions():
-    """Show actionable alerts and recommendations."""
-    st.markdown('<div class="section-header">🚨 Daily Alerts & Recommended Actions</div>', unsafe_allow_html=True)
-    
-    data = load_daily_fake_leads()
-    
-    if data.empty:
-        st.success("✅ No alerts today - all sources are performing well!")
-        return
-    
-    # Critical alerts
-    critical_sources = data[data['daily_risk_level'] == 'CRITICAL']
-    high_sources = data[data['daily_risk_level'] == 'HIGH'] 
-    medium_sources = data[data['daily_risk_level'] == 'MEDIUM']
-    
-    if not critical_sources.empty:
-        st.markdown('<div class="alert-critical">🚨 <strong>CRITICAL ALERTS - Immediate Action Required</strong></div>', unsafe_allow_html=True)
-        for _, source in critical_sources.iterrows():
-            st.error(f"🔴 **{source['lead_source']}**: {source['fake_leads_count']} fake leads ({source['fake_leads_percentage']:.1f}%) - **PAUSE THIS SOURCE**")
-    
-    if not high_sources.empty:
-        st.markdown('<div class="alert-warning">⚠️ <strong>HIGH RISK ALERTS - Review Required</strong></div>', unsafe_allow_html=True)
-        for _, source in high_sources.iterrows():
-            st.warning(f"🟠 **{source['lead_source']}**: {source['fake_leads_count']} fake leads ({source['fake_leads_percentage']:.1f}%) - **INVESTIGATE IMMEDIATELY**")
-    
-    if not medium_sources.empty:
-        st.markdown('<div class="alert-warning">🔍 <strong>MONITOR CLOSELY</strong></div>', unsafe_allow_html=True)
-        for _, source in medium_sources.iterrows():
-            st.info(f"🟡 **{source['lead_source']}**: {source['fake_leads_count']} fake leads ({source['fake_leads_percentage']:.1f}%) - **TRACK PATTERNS**")
+        else:
+            st.info("📊 No problematic leads found for selected date range to export")
 
 
 def get_last_refresh_time():
@@ -671,492 +558,65 @@ def run_etl_pipeline():
         st.error(f"❌ Error running ETL pipeline: {e}")
         return False
 
-def generate_pdf_report():
-    """Generate PDF version of the daily fake leads report using fpdf2."""
-    try:
-        from fpdf import FPDF
-        
-        # Get all the data for the report
-        data = load_daily_fake_leads()
-        problematic_leads = load_daily_fake_leads_detail()
-        
-        # Calculate summary metrics
-        total_leads_today = data['total_leads_today'].sum() if not data.empty else 0
-        total_fake_leads = data['fake_leads_count'].sum() if not data.empty else 0
-        total_fake_percentage = (total_fake_leads / total_leads_today * 100) if total_leads_today > 0 else 0
-        total_high_risk = data['critical_fraud_count'].sum() if not data.empty and 'critical_fraud_count' in data.columns else 0
-        total_high_risk_percentage = (total_high_risk / total_leads_today * 100) if total_leads_today > 0 else 0
-        
-        # Get timestamps
-        current_date = datetime.now().strftime("%A, %B %d, %Y")
-        last_refresh = get_last_refresh_time()
-        
-        # Create PDF
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font('Arial', 'B', 16)
-        
-        # Header (ASCII-safe)
-        pdf.cell(0, 10, 'Daily Fake Leads Report', 0, 1, 'C')
-        pdf.set_font('Arial', '', 12)
-        pdf.cell(0, 8, current_date, 0, 1, 'C')
-        pdf.cell(0, 8, f'Last Updated: {last_refresh}', 0, 1, 'C')
-        pdf.ln(10)
-        
-        # Summary Section
-        pdf.set_font('Arial', 'B', 14)
-        pdf.cell(0, 10, "Today's Summary", 0, 1)
-        pdf.set_font('Arial', '', 11)
-        
-        # Summary metrics
-        pdf.cell(0, 8, f"Leads Validated Today: {total_leads_today:,}", 0, 1)
-        pdf.cell(0, 8, f"Fake Leads Today: {total_fake_leads} ({total_fake_percentage:.1f}%)", 0, 1)
-        pdf.cell(0, 8, f"High Risk Leads Today: {total_high_risk} ({total_high_risk_percentage:.1f}%)", 0, 1)
-        pdf.ln(10)
-        
-        # Source breakdown table
-        if not data.empty:
-            pdf.set_font('Arial', 'B', 14)
-            pdf.cell(0, 10, 'Fake Leads by Lead Source', 0, 1)
-            pdf.set_font('Arial', 'B', 9)
-            
-            # Table headers
-            col_widths = [50, 25, 25, 25, 20, 25]
-            headers = ['Lead Source', 'Total', 'Fake', 'High Risk', 'Fake %', 'Risk Level']
-            
-            for i, header in enumerate(headers):
-                pdf.cell(col_widths[i], 8, header, 1, 0, 'C')
-            pdf.ln()
-            
-            # Table data
-            pdf.set_font('Arial', '', 8)
-            sorted_data = data.sort_values(['fake_leads_count', 'critical_fraud_count'], ascending=[False, False])
-            
-            for _, row in sorted_data.iterrows():
-                critical_count = row.get('critical_fraud_count', 0)
-                pdf.cell(col_widths[0], 6, str(row['lead_source'])[:25], 1, 0)
-                pdf.cell(col_widths[1], 6, str(row['total_leads_today']), 1, 0, 'C')
-                pdf.cell(col_widths[2], 6, str(row['fake_leads_count']), 1, 0, 'C')
-                pdf.cell(col_widths[3], 6, str(critical_count), 1, 0, 'C')
-                pdf.cell(col_widths[4], 6, f"{row['fake_leads_percentage']:.1f}%", 1, 0, 'C')
-                pdf.cell(col_widths[5], 6, str(row['daily_risk_level']), 1, 0, 'C')
-                pdf.ln()
-            
-            pdf.ln(10)
-        
-        # Detailed problematic leads
-        if not problematic_leads.empty:
-            pdf.set_font('Arial', 'B', 14)
-            pdf.cell(0, 10, f'Problematic Leads Details ({len(problematic_leads)} leads)', 0, 1)
-            pdf.set_font('Arial', '', 9)
-            
-            # Group by source
-            for source in problematic_leads['lead_source'].unique():
-                source_leads = problematic_leads[problematic_leads['lead_source'] == source]
-                
-                pdf.set_font('Arial', 'B', 11)
-                pdf.cell(0, 8, f'{source} ({len(source_leads)} leads)', 0, 1)
-                pdf.set_font('Arial', '', 9)
-                
-                for i, (_, lead) in enumerate(source_leads.iterrows(), 1):
-                    type_indicator = "FAKE" if lead['lead_type'] == 'FAKE' else "HIGH RISK"
-                    
-                    # Lead info (using ASCII-safe characters)
-                    pdf.cell(0, 6, f"{i}. {type_indicator}: {lead['first_name']} {lead['last_name']} (ID: {lead['lead_id']})", 0, 1)
-                    pdf.cell(0, 5, f"   Email: {lead['email']}", 0, 1)
-                    pdf.cell(0, 5, f"   Phone: {lead['phone'] if lead['phone'] else 'Missing'}", 0, 1)
-                    pdf.cell(0, 5, f"   Company: {lead['company'] if lead['company'] else 'Missing'}", 0, 1)
-                    pdf.cell(0, 5, f"   Fraud Score: {lead['fraud_score']}/10 | Action: {lead['recommendation'].upper()}", 0, 1)
-                    
-                    # Fraud factors (truncated for space, ASCII-safe)
-                    fraud_factors = str(lead['fraud_factors'])[:80]
-                    if len(str(lead['fraud_factors'])) > 80:
-                        fraud_factors += '...'
-                    # Remove any problematic Unicode characters
-                    fraud_factors = fraud_factors.encode('ascii', 'ignore').decode('ascii')
-                    pdf.cell(0, 5, f"   Fraud Factors: {fraud_factors}", 0, 1)
-                    
-                    pdf.ln(3)
-                
-                pdf.ln(5)
-        
-        # Footer
-        pdf.ln(10)
-        pdf.set_font('Arial', 'I', 8)
-        pdf.cell(0, 5, 'Generated by Lead Validation System - Daily Fake Leads Monitoring Report', 0, 1, 'C')
-        
-        # Return PDF as bytes
-        pdf_output = pdf.output(dest='S')
-        # Handle different fpdf2 return types
-        if isinstance(pdf_output, bytearray):
-            return bytes(pdf_output)
-        elif isinstance(pdf_output, bytes):
-            return pdf_output
-        else:
-            return pdf_output.encode('latin-1')
-        
-    except ImportError:
-        st.error("PDF generation requires fpdf2. Please install: pip install fpdf2")
-        return None
-    except Exception as e:
-        st.error(f"Error generating PDF: {e}")
-        return None
-
-def generate_html_report():
-    """Generate HTML version of the daily fake leads report."""
-    try:
-        # Get all the data for the report
-        data = load_daily_fake_leads()
-        problematic_leads = load_daily_fake_leads_detail()
-        
-        # Calculate summary metrics
-        total_leads_today = data['total_leads_today'].sum() if not data.empty else 0
-        total_fake_leads = data['fake_leads_count'].sum() if not data.empty else 0
-        total_fake_percentage = (total_fake_leads / total_leads_today * 100) if total_leads_today > 0 else 0
-        total_high_risk = data['critical_fraud_count'].sum() if not data.empty and 'critical_fraud_count' in data.columns else 0
-        total_high_risk_percentage = (total_high_risk / total_leads_today * 100) if total_leads_today > 0 else 0
-        
-        # Get timestamps
-        current_date = datetime.now().strftime("%A, %B %d, %Y")
-        last_refresh = get_last_refresh_time()
-        generation_time = datetime.now().strftime("%I:%M %p on %B %d, %Y")
-        
-        # Build HTML content
-        html_content = f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Daily Fake Leads Report - {current_date}</title>
-            <style>
-                body {{ 
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-                    margin: 0; 
-                    padding: 20px; 
-                    background-color: #f5f5f5; 
-                    color: #333;
-                }}
-                .container {{ 
-                    max-width: 1200px; 
-                    margin: 0 auto; 
-                    background: white; 
-                    padding: 30px; 
-                    border-radius: 8px; 
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                }}
-                .header {{ 
-                    text-align: center; 
-                    margin-bottom: 30px; 
-                    border-bottom: 3px solid #d32f2f; 
-                    padding-bottom: 20px; 
-                }}
-                .title {{ 
-                    font-size: 28px; 
-                    color: #d32f2f; 
-                    font-weight: bold; 
-                    margin-bottom: 10px;
-                }}
-                .subtitle {{ 
-                    font-size: 14px; 
-                    color: #666; 
-                    margin: 5px 0;
-                }}
-                .metrics {{ 
-                    display: grid; 
-                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
-                    gap: 20px; 
-                    margin: 30px 0; 
-                }}
-                .metric {{ 
-                    text-align: center; 
-                    padding: 20px; 
-                    border: 1px solid #ddd; 
-                    border-radius: 8px; 
-                    background: #fafafa;
-                }}
-                .metric-value {{ 
-                    font-size: 24px; 
-                    font-weight: bold; 
-                    color: #1976d2; 
-                    display: block;
-                }}
-                .metric-label {{ 
-                    font-size: 12px; 
-                    color: #666; 
-                    margin-top: 5px;
-                }}
-                .section {{ 
-                    margin: 30px 0; 
-                }}
-                .section-title {{ 
-                    font-size: 18px; 
-                    font-weight: bold; 
-                    color: #1976d2; 
-                    border-bottom: 2px solid #1976d2; 
-                    padding-bottom: 8px; 
-                    margin-bottom: 15px;
-                }}
-                table {{ 
-                    width: 100%; 
-                    border-collapse: collapse; 
-                    margin: 15px 0; 
-                    font-size: 14px;
-                }}
-                th, td {{ 
-                    border: 1px solid #ddd; 
-                    padding: 12px 8px; 
-                    text-align: left; 
-                }}
-                th {{ 
-                    background-color: #f8f9fa; 
-                    font-weight: bold; 
-                    color: #495057;
-                }}
-                .risk-critical {{ background-color: #ffcdd2; }}
-                .risk-high {{ background-color: #ffe0b2; }}
-                .risk-medium {{ background-color: #fff3e0; }}
-                .risk-low {{ background-color: #f3e5f5; }}
-                .risk-clean {{ background-color: #e8f5e8; }}
-                .lead-card {{ 
-                    border: 1px solid #ddd; 
-                    padding: 15px; 
-                    margin: 15px 0; 
-                    border-radius: 6px; 
-                    background-color: #fafafa;
-                }}
-                .fake-lead {{ 
-                    border-left: 5px solid #f44336; 
-                    background-color: #ffebee; 
-                }}
-                .high-risk-lead {{ 
-                    border-left: 5px solid #ff9800; 
-                    background-color: #fff8e1; 
-                }}
-                .footer {{ 
-                    text-align: center; 
-                    margin-top: 40px; 
-                    font-size: 12px; 
-                    color: #666; 
-                    border-top: 1px solid #eee; 
-                    padding-top: 20px;
-                }}
-                @media print {{
-                    body {{ background-color: white; }}
-                    .container {{ box-shadow: none; }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="header">
-                    <div class="title">🚨 Daily Fake Leads Report</div>
-                    <div class="subtitle">{current_date}</div>
-                    <div class="subtitle">Last Updated: {last_refresh}</div>
-                    <div class="subtitle">Report Generated: {generation_time}</div>
-                </div>
-                
-                <div class="section">
-                    <div class="section-title">📊 Today's Summary</div>
-                    <div class="metrics">
-                        <div class="metric">
-                            <span class="metric-value">{total_leads_today:,}</span>
-                            <div class="metric-label">Leads Validated Today</div>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-value">{total_fake_leads}</span>
-                            <div class="metric-label">Fake Leads ({total_fake_percentage:.1f}%)</div>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-value">{total_high_risk}</span>
-                            <div class="metric-label">High Risk Leads ({total_high_risk_percentage:.1f}%)</div>
-                        </div>
-                    </div>
-                </div>
-        """
-        
-        # Add source breakdown table
-        if not data.empty:
-            html_content += f"""
-                <div class="section">
-                    <div class="section-title">📊 Fake Leads by Lead Source</div>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Lead Source</th>
-                                <th>Total Leads</th>
-                                <th>Fake Leads</th>
-                                <th>High Risk</th>
-                                <th>Fake %</th>
-                                <th>Risk Level</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-            """
-            
-            # Sort data for HTML
-            sorted_data = data.sort_values(['fake_leads_count', 'critical_fraud_count'], ascending=[False, False])
-            
-            for _, row in sorted_data.iterrows():
-                risk_class = f"risk-{row['daily_risk_level'].lower()}"
-                critical_count = row.get('critical_fraud_count', 0)
-                html_content += f"""
-                            <tr class="{risk_class}">
-                                <td><strong>{row['lead_source']}</strong></td>
-                                <td>{row['total_leads_today']}</td>
-                                <td>{row['fake_leads_count']}</td>
-                                <td>{critical_count}</td>
-                                <td>{row['fake_leads_percentage']:.1f}%</td>
-                                <td>{row['daily_risk_level']}</td>
-                            </tr>
-                """
-            
-            html_content += """
-                        </tbody>
-                    </table>
-                </div>
-            """
-        
-        # Add detailed lead analysis
-        if not problematic_leads.empty:
-            fake_count = len(problematic_leads[problematic_leads['lead_type'] == 'FAKE'])
-            high_risk_count = len(problematic_leads[problematic_leads['lead_type'] == 'HIGH_RISK'])
-            
-            html_content += f"""
-                <div class="section">
-                    <div class="section-title">🔍 Problematic Leads Details</div>
-                    <p><strong>Found {len(problematic_leads)} problematic leads today:</strong> {fake_count} fake leads + {high_risk_count} high risk leads</p>
-            """
-            
-            # Group by source
-            for source in problematic_leads['lead_source'].unique():
-                source_leads = problematic_leads[problematic_leads['lead_source'] == source]
-                source_fake_count = len(source_leads[source_leads['lead_type'] == 'FAKE'])
-                source_high_risk_count = len(source_leads[source_leads['lead_type'] == 'HIGH_RISK'])
-                
-                html_content += f"<h3>{source} ({len(source_leads)} leads)</h3>"
-                
-                for i, (_, lead) in enumerate(source_leads.iterrows(), 1):
-                    lead_class = "fake-lead" if lead['lead_type'] == 'FAKE' else "high-risk-lead"
-                    type_indicator = "🚨 FAKE" if lead['lead_type'] == 'FAKE' else "⚠️ HIGH RISK"
-                    
-                    html_content += f"""
-                    <div class="lead-card {lead_class}">
-                        <h4>{type_indicator}: {lead['first_name']} {lead['last_name']} (ID: {lead['lead_id']})</h4>
-                        <p><strong>Fraud Score:</strong> {lead['fraud_score']}/10 | <strong>Recommendation:</strong> {lead['recommendation'].upper()}</p>
-                        <p><strong>Contact Info:</strong></p>
-                        <ul>
-                            <li><strong>Email:</strong> {lead['email']}</li>
-                            <li><strong>Phone:</strong> {lead['phone'] if lead['phone'] else 'Missing'}</li>
-                            <li><strong>Company:</strong> {lead['company'] if lead['company'] else 'Missing'}</li>
-                        </ul>
-                        <p><strong>Fraud Factors:</strong> {lead['fraud_factors']}</p>
-                        <p><strong>Quality Issues:</strong> {lead['quality_factors']}</p>
-                    </div>
-                    """
-            
-            html_content += "</div>"
-        
-        # Close HTML
-        html_content += f"""
-                <div class="footer">
-                    <p>Generated by Lead Validation System - Daily Fake Leads Monitoring Report</p>
-                    <p>Report generated: {generation_time}</p>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        
-        return html_content.encode('utf-8')
-        
-    except Exception as e:
-        st.error(f"Error generating HTML: {e}")
-        return None
-
 def main():
-    """Main daily fake leads report."""
+    """Main fake leads report with date range selection."""
     current_date = datetime.now().strftime("%A, %B %d, %Y")
     last_refresh = get_last_refresh_time()
     
+    # Date range selector
+    col_date1, col_date2, col_refresh = st.columns([1, 1, 1])
+    
+    with col_date1:
+        start_date = st.date_input(
+            "Start Date",
+            value=datetime.now().date(),
+            help="Select the start date for the report"
+        )
+    
+    with col_date2:
+        end_date = st.date_input(
+            "End Date", 
+            value=datetime.now().date(),
+            help="Select the end date for the report"
+        )
+    
+    with col_refresh:
+        st.markdown("<br>", unsafe_allow_html=True)  # Align with date inputs
+        if st.button("🔄 Refresh Data", help="Run ETL pipeline to sync latest data from Salesforce"):
+            if run_etl_pipeline():
+                st.rerun()
+            else:
+                st.error("Failed to refresh data. Please check ETL configuration.")
+    
+    # Determine report title based on date range
+    if start_date == end_date:
+        if start_date == datetime.now().date():
+            report_title = "🚨 Daily Fake Leads Report (Today)"
+            report_subtitle = current_date
+        else:
+            report_title = "🚨 Fake Leads Report"
+            report_subtitle = start_date.strftime("%A, %B %d, %Y")
+    else:
+        report_title = "🚨 Fake Leads Report"
+        report_subtitle = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}"
+    
     st.markdown(f'''
     <div class="main-header">
-        🚨 Daily Fake Leads Report<br>
-        <small>{current_date}</small><br>
+        {report_title}<br>
+        <small>{report_subtitle}</small><br>
         <small style="color: #666; font-size: 0.8rem;">Last Updated: {last_refresh}</small>
     </div>
     ''', unsafe_allow_html=True)
     
-    # Inline refresh button
-    if st.button("🔄 Refresh Data", help="Run ETL pipeline to sync latest data from Salesforce"):
-        if run_etl_pipeline():
-            st.rerun()
-        else:
-            st.error("Failed to refresh data. Please check ETL configuration.")
+    # Store date range in session state for functions to use
+    st.session_state['report_start_date'] = start_date
+    st.session_state['report_end_date'] = end_date
     
     # Main report sections
     show_daily_summary()
     st.markdown("---")
     
     show_fake_leads_by_source_table()
-    st.markdown("---")
-    
-    show_fake_leads_detail()
-    st.markdown("---")
-    
-    show_hourly_breakdown()
-    
-    # Footer with navigation
-    st.markdown("---")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("📊 Go to Full Dashboard"):
-            st.markdown("**Run:** `streamlit run src/dashboard/validation_dashboard.py`")
-    
-    with col2:
-        if st.button("🎯 Go to Simplified Dashboard"):
-            st.markdown("**Run:** `python run_simplified_dashboard.py`")
-    
-    # Report Download section
-    st.markdown("---")
-    st.markdown("### 📥 Export Options")
-    
-    col_export1, col_export2 = st.columns(2)
-    
-    with col_export1:
-        if st.button("📄 Download PDF Report", help="Generate and download PDF version of this report", type="secondary", use_container_width=True):
-            try:
-                pdf_data = generate_pdf_report()
-                if pdf_data:
-                    st.download_button(
-                        label="📥 Download PDF",
-                        data=pdf_data,
-                        file_name=f"daily_fake_leads_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-                else:
-                    st.error("Failed to generate PDF report")
-            except Exception as e:
-                st.error(f"Error generating PDF: {e}")
-    
-    with col_export2:
-        if st.button("🌐 Download HTML Report", help="Generate and download HTML version of this report", type="secondary", use_container_width=True):
-            try:
-                html_data = generate_html_report()
-                if html_data:
-                    st.download_button(
-                        label="📥 Download HTML",
-                        data=html_data,
-                        file_name=f"daily_fake_leads_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
-                        mime="text/html",
-                        use_container_width=True
-                    )
-                else:
-                    st.error("Failed to generate HTML report")
-            except Exception as e:
-                st.error(f"Error generating HTML: {e}")
     
 
 

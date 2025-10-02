@@ -1,13 +1,13 @@
--- Daily Fake Leads by Lead Source Report
+-- Daily Fake Leads by Lead Source Report (Fixed for actual database structure)
 -- Shows fake leads per lead source for the current day (based on created_date)
 
-CREATE OR REPLACE VIEW leads.daily_fake_leads_by_source AS
+CREATE OR REPLACE VIEW daily_fake_leads_by_source AS
 WITH today_leads AS (
     SELECT 
         COALESCE(lead_source, 'Unknown') as lead_source,
         COUNT(*) as total_leads_today,
         
-        -- Fake lead counts
+        -- Fake lead counts (using actual database structure)
         COUNTIF(COALESCE(api_fake_lead, false) = true) as fake_leads_count,
         COUNTIF(COALESCE(api_fraud_score, 0) >= 8) as critical_fraud_count,
         COUNTIF(COALESCE(api_fraud_score, 0) >= 5) as high_fraud_count,

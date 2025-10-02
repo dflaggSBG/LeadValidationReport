@@ -35,15 +35,17 @@ def main():
     
     current_date = datetime.now().strftime("%A, %B %d, %Y")
     
-    print("🚨 Starting Daily Fake Leads Report...")
-    print(f"📅 Report Date: {current_date}")
+    print("🚨 Starting Fake Leads Report Dashboard...")
+    print(f"📅 Current Date: {current_date}")
     print(f"📊 Dashboard will be available at: http://localhost:{port}")
-    print("\n📋 This streamlined report shows:")
-    print("   • 📊 Today's fake leads summary with last refresh timestamp")
-    print("   • 📊 Fake leads by source table (data-dense view)")
-    print("   • 🔍 Individual fake lead analysis with validation details")
-    print("   • ⏰ Hourly fraud pattern analysis by source")
-    print("   • 🔄 ETL pipeline refresh capability\n")
+    print("\n📋 This flexible report features:")
+    print("   • 📅 Date range selection (single day or multi-day periods)")
+    print("   • 📊 Fake & high risk leads summary with last refresh timestamp")
+    print("   • 📊 Leads by source table (data-dense view)")
+    print("   • 🔍 Individual lead analysis with validation details")
+    print("   • ⏰ Hourly pattern analysis by source")
+    print("   • 🔄 ETL pipeline refresh capability")
+    print("   • 📄 PDF & HTML export options\n")
     
     try:
         # Run streamlit with the daily report
